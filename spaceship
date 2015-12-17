@@ -1,0 +1,624 @@
+# ---------------------------------------------------------
+# AI Ship Controller for codegames.io
+# Zamaroht, December 2015
+# www.zamaroht.com
+# ---------------------------------------------------------
+# The CommandSelector controls the ship by setting a COMMAND.
+# The current command sets the aim_* variables.
+# The update_* functions perform the movements.
+# The 'shoot' function can be used anywhere in the code.
+# Realtime manipulation instructions at the bottom.
+# ---------------------------------------------------------
+# Let's pwn'em all ;)
+# ---------------------------------------------------------
+
+# User config
+uTURRET_MODE = 0				# Turns turret mode on or off
+
+uPASSTHROUGH_MODE = 0			# What happens when the ships pass through each other.
+								# 0: Default (pass-trough: search, stand close: stay)
+								# 1: Escape
+
+uWEIGHTED_PREDICTIONS = 0		# Uses the last 3 positions to predict. Useful if the enemy does micro-dodging.
+uDISTANCE_TO_SLOW = 200			# How far to be from the enemy to slow down to his speed.
+
+uSHARP_TURNS = 1				# If it slows down on sharp turns.
+uSUPERSHARP_TURNS = 1			# Same as uSHARP_TURNS, but more agressive slowdown. WARNING: Could slow down to 0.
+uSHARP_TURN_ANGLE = 60			# [if uSHARP_TURNS] How big the angle delta should be to slow down.
+uSHARP_TURN_MIN_SPEED = 3		# [if uSHARP_TURNS] The minimum speed during sharp turning. Ignored if a/uSUPERSHARP_TURNS.
+
+uDODGE_BULLETS = 1				# If the bullet-dodging mechanism is on or off.
+uDODGE_FIRST_SIGHT = 0			# [if uDODGE_BULLETS] Always dodges at first front-side encounter, even if it is ready to shoot.
+								# 					  Useful if the enemy has smart shooting.
+uMICRO_DODGE = 0				# [if uDODGE_BULLETS] Useful if the enemy uses position-based prediction.
+uDODGE_ANGLE = 60				# [if uDODGE_BULLETS and !uMICRO_DODGE] How sharply the ship evades.
+
+uEXACT_FOLLOW = 0				# If the ship should follow enemies at the same point they touched the border.
+
+# Auto settings - Set automatically by the AI
+aSUPERSHARP_TURNS = 0			# Automated SUPERSHARP_TURNS in corner cases, despiste uSUPERSHARP_TURNS value.
+
+# -------------------------- VARS --------------------------
+if !init
+	time = 0
+
+	# consts
+	cLEFT = -180
+	cRIGHT = 180
+	cCOMMAND_NULL = 0
+	cCOMMAND_FOLLOW = 1
+	cCOMMAND_FOLLOW_PRED = 2
+	cCOMMAND_SEARCH = 3
+	cCOMMAND_GOTO_DIR = 4
+	cRAD2DEG = 57.295779
+	cDEG2RAD = 0.017453
+
+	# extra data
+	fire_timeout = 0					# Cycles left to be able to shoot again
+
+	enemy_speed = 0
+	enemy_direction = 0
+	enemy_delta_direction = 0			# Degrees the enemy turned in this cycle (- left, + right)
+
+	delta_relative_speed = 0			# Speed difference between us and them
+	delta_speed = 0						# My speed variation per frame
+
+	tracker_enemy_x = 0					# The tracker tracks the X and Y of self and enemy.
+	tracker_enemy_y = 0					# It is reset to 0 every time the enemy is seen or lost sight of
+	tracker_self_x = 0					# The enemy position is relative to the point where the self ship
+	tracker_self_y = 0					# was when the enemy was sighted.
+
+	# vars
+	aim_direction = 0
+	aim_speed = 5
+	command = cCOMMAND_NULL
+end
+
+# -------------------------- MAIN --------------------------
+
+# -------- main loop --------
+do_extra_data()
+do_events()
+do_commands()
+do_auto()
+
+update_aim()
+update_speed()
+
+tracker_enemy_x_last2 = tracker_enemy_x_last1
+tracker_enemy_x_last1 = tracker_enemy_x_last
+tracker_enemy_x_last = tracker_enemy_x
+tracker_enemy_y_last2 = tracker_enemy_y_last1
+tracker_enemy_y_last1 = tracker_enemy_y_last
+tracker_enemy_y_last = tracker_enemy_y
+tracker_self_x_last = tracker_self_x
+tracker_self_y_last = tracker_self_y
+speed_last = speed
+direction_last = direction
+energy_last = energy
+enemy_direction_last = enemy_direction
+enemy_distance_last = enemy_distance
+enemy_angle_last = enemy_angle
+enemy_speed_last1 = enemy_speed_last
+enemy_speed_last = enemy_speed
+enemy_visible_last3 = enemy_visible_last2
+enemy_visible_last2 = enemy_visible_last1
+enemy_visible_last1 = enemy_visible_last
+enemy_visible_last = enemy_visible
+command_last = command
+
+time += 1
+init = 1
+
+# --------------------------- LOOP ---------------------------
+function do_extra_data()
+	extra_data_tracker()
+	extra_data_fire_timeout()
+	extra_data_enemy_speed()
+	extra_data_enemy_direction()
+	extra_data_enemy_delta_direction()
+end
+
+function do_events()
+	event_visible()
+	event_angle()
+	event_stop()
+end
+
+function do_commands()
+	if command == cCOMMAND_FOLLOW
+		command_follow()
+	else if command == cCOMMAND_FOLLOW_PRED
+		command_follow_pred()
+	else if command == cCOMMAND_SEARCH
+		command_search()
+	else if command == cCOMMAND_GOTO_DIR
+		command_goto_dir()
+	end
+
+	if command_last == cCOMMAND_GOTO_DIR and command != cCOMMAND_GOTO_DIR
+		escape_sign = 0
+	end
+end
+
+function do_auto()
+	if uDODGE_BULLETS
+		auto_dodge_bullets()
+	end
+	auto_shoot()
+end
+
+function event_visible()
+	if !enemy_visible and enemy_visible_last
+		onEnemyInvisible()
+	end
+
+	if enemy_visible and !enemy_visible_last
+		onEnemyVisible()
+	end
+end
+
+function event_angle()
+	
+end
+
+function event_stop()
+	if enemy_visible and enemy_visible_last and enemy_visible_last1 and enemy_speed == 0 and enemy_speed_last == 0 and enemy_speed_last1 == 0
+		onEnemyStop()
+	end
+end
+
+# -------- commands --------	// Here, the targets should be set
+function command_follow()
+	aim_direction = direction + enemy_angle
+	if enemy_distance < 50
+		aim_speed = 1
+	else
+		aim_speed = 5
+	end
+end
+
+function command_follow_pred()
+	if (!uWEIGHTED_PREDICTIONS and enemy_visible and enemy_visible_last) or (uWEIGHTED_PREDICTIONS and enemy_visible and enemy_visible_last and enemy_visible_last1 and enemy_visible_last2)
+		orgx = ptcX(enemy_distance, enemy_angle + direction)
+		orgy = ptcY(enemy_distance, enemy_angle + direction)
+		if uWEIGHTED_PREDICTIONS
+			velx = (tracker_enemy_x - tracker_enemy_x_last2) / 3
+			vely = (tracker_enemy_y - tracker_enemy_y_last2) / 3
+		else
+			velx = tracker_enemy_x - tracker_enemy_x_last
+			vely = tracker_enemy_y - tracker_enemy_y_last
+		end
+
+		a = (velx*velx) + (vely*vely) - (10*10)
+		b = 2 * ((velx*orgx) + (vely * orgy))
+		c = (orgx*orgx) + (orgy*orgy)
+
+		d = (b*b) - (4*a*c)
+		if d < 0
+			return 0
+		end
+
+		t1 = (-b + sqrt(d)) / (2*a)
+		t2 = (-b - sqrt(d)) / (2*a)
+
+		if t1 < t2 and t1 > 0
+			t = t1
+		else
+			t = t2
+		end
+
+		aim_x = predictPositionX(orgx, orgy, velx, vely, t)
+		aim_y = predictPositionY(orgx, orgy, velx, vely, t)
+
+		aim_direction = atan2(aim_y, aim_x)
+
+		if to180range(aim_direction - direction) > 70
+			aSUPERSHARP_TURNS = 1
+		else
+			aSUPERSHARP_TURNS = 0
+		end
+
+		if enemy_distance > uDISTANCE_TO_SLOW
+			aim_speed = 5
+		else
+			aSUPERSHARP_TURNS = 1
+			aim_speed = enemy_speed - 0.3
+		end
+
+		choose_search_side()
+	else
+		aim_speed = 5
+	end
+end
+
+function command_search()
+	aim_direction = direction + (170 * search_side)
+	aim_speed = 5
+end
+
+function command_goto_dir()
+	aim_direction = goto_dir
+	aim_speed = 5
+
+	if uDODGE_BULLETS
+		if goto_timer % 30 == 0
+			if escape_sign == 0
+				escape_sign = randsign()
+			else
+				escape_sign = 0
+			end
+		end
+
+		aim_direction = goto_dir + (((goto_timer / 30) * 30) * escape_sign)
+	end
+
+	if goto_timer >= 90
+		command = cCOMMAND_SEARCH
+	else
+		goto_timer += 1
+	end
+end
+
+# ------------------------- EVENTS -------------------------
+function onEnemyStop()
+	if uPASSTHROUGH_MODE == 1 and enemy_distance < uDISTANCE_TO_SLOW
+		goto_timer = 0
+		goto_dir = direction
+		command = cCOMMAND_GOTO_DIR
+	end
+end
+
+function onEnemyVisible()
+	reset_tracker()
+	command = cCOMMAND_FOLLOW_PRED
+end
+
+function onEnemyInvisible()
+	if uTURRET_MODE
+		command = cCOMMAND_SEARCH
+		return 0
+	end
+
+	relative_facing_angle = abs(constrain(direction_last - enemy_direction_last, 360))
+	if relative_facing_angle < 90 or relative_facing_angle > 270
+		# gone away
+		if enemy_distance_last < 350
+			# goto follow
+			if uEXACT_FOLLOW
+				goto_dir = atan2(tracker_enemy_y_last - tracker_self_y_last, tracker_enemy_x_last - tracker_self_x_last)
+			else
+				goto_dir = enemy_direction_last
+			end
+			goto_timer = 0
+			command = cCOMMAND_GOTO_DIR
+		else
+			# now comming from behind
+			command = cCOMMAND_SEARCH
+		end
+	else
+		# passthrough
+		if uPASSTHROUGH_MODE == 1
+			goto_timer = 0
+			goto_dir = direction
+			command = cCOMMAND_GOTO_DIR
+		else
+			command = cCOMMAND_SEARCH
+		end
+	end
+
+	reset_tracker()
+end
+
+# -------------------------- AUTO --------------------------
+function auto_dodge_bullets()
+	if enemy_visible and (heading_to_me() or enemy_speed == 0)
+		if uDODGE_FIRST_SIGHT and !dodging
+			fire_timeout = 40
+		end
+
+	 	if fire_timeout > 10
+			dodging = 1
+
+			if uMICRO_DODGE
+				aim_direction = rand(0, 360)
+			else
+				x = ptcX(enemy_distance, direction + enemy_angle) / 2
+				y = ptcY(enemy_distance, direction + enemy_angle) / 2
+
+				aim_direction = atan2(y, x) + (uDODGE_ANGLE * dodge_side)
+			end
+		else
+			dodging = 0
+		end
+	else
+		dodging = 0
+		choose_dodge_side()
+	end
+end
+
+function auto_shoot()
+	if enemy_visible and enemy_visible_last and enemy_visible_last1
+		if enemy_speed <= 0.2
+			# a = abs(to180range(constrain(direction - atan2(tracker_self_y - tracker_enemy_y, tracker_self_x - tracker_enemy_x), 360)))
+			a = enemy_angle
+			if abs(a) < 5
+				aaa = 1
+				shoot()
+			end
+		else
+			tx = (tracker_self_x - tracker_enemy_x) / (ptcX(enemy_speed, enemy_direction) - ptcX(10, direction))
+			ty = (tracker_self_y - tracker_enemy_y) / (ptcY(enemy_speed, enemy_direction) - ptcY(10, direction))
+
+			if abs(tx - ty) < 20 #or (enemy_distance < 45 and abs(enemy_angle) < 5)
+				aaa = 2
+				shoot()
+			end
+		end
+	end
+end
+
+# -------------------- LOW-LEVEL CONTROL --------------------
+
+function update_aim()
+	delta = aim_direction - direction
+	delta = to180range(delta)
+
+	right(delta)
+end
+
+function update_speed()
+	if uTURRET_MODE
+		slower(999)
+		return 0
+	end
+
+	angle_left = to180range(aim_direction - direction)
+
+	# Slow speed cornering
+	if (aSUPERSHARP_TURNS or uSUPERSHARP_TURNS) and !dodging
+		if abs(angle_left) > uSHARP_TURN_ANGLE / 2
+			real_aim_speed = 0
+		else
+			real_aim_speed = aim_speed
+	 	end
+	else if uSHARP_TURNS and !dodging
+		if abs(angle_left) > uSHARP_TURN_ANGLE
+			real_aim_speed = uSHARP_TURN_MIN_SPEED
+		else
+			real_aim_speed = aim_speed
+	 	end
+	else
+		real_aim_speed = aim_speed
+	end
+
+	speed_left = real_aim_speed - speed
+
+	# Calculate impulse and apply
+	if real_aim_speed > speed and abs(speed_left) > 0
+		impulse = 5
+	else if real_aim_speed < speed and abs(speed_left) > 0.1
+		impulse = -5
+	else
+		impulse = 0
+	end
+
+	faster(impulse)
+end
+
+function shoot()
+	if fire
+		fire_timeout = 50
+	end
+end
+
+# ------------------------ EXTRA DATA ------------------------
+function extra_data_enemy_delta_direction()
+	enemy_delta_direction = enemy_direction - enemy_direction_last
+end
+
+function extra_data_fire_timeout()
+	if fire_timeout > 0
+		fire_timeout -= 1
+	end
+end
+
+function extra_data_enemy_speed()
+	if enemy_visible and enemy_visible_last
+		enemy_speed = calcDistance(tracker_enemy_x, tracker_enemy_y, tracker_enemy_x_last, tracker_enemy_y_last)
+	else
+		enemy_speed = 0
+	end
+	delta_relative_speed = enemy_speed + speed
+end
+
+function extra_data_enemy_direction()
+	x = tracker_enemy_x - tracker_enemy_x_last
+	y = tracker_enemy_y - tracker_enemy_y_last
+
+	enemy_direction = constrain(atan2(y, x), 360)
+end
+
+function extra_data_tracker()
+	tracker_self_x += ptcX(speed, direction)
+	tracker_self_y += ptcY(speed, direction)
+
+	tracker_enemy_x = ptcX(enemy_distance, enemy_angle + direction) + tracker_self_x
+	tracker_enemy_y = ptcY(enemy_distance, enemy_angle + direction) + tracker_self_y
+end
+
+# ------------------------- GETTERS -------------------------
+
+function heading_to_me()
+	if enemy_visible and enemy_visible_last
+		if abs(constrain(enemy_direction, 360) - constrain(enemy_angle + direction + 180, 360)) < 10
+			return 1
+		else
+			return 0
+		end
+	else
+		return 0
+	end
+end
+
+function headed_front()
+	if enemy_visible and enemy_visible_last
+		if abs(constrain(direction - enemy_direction - 180, 360)) < 10
+			return 1
+		else
+			return 0
+		end
+	else
+		return 0
+	end
+end
+
+function headed_behind()
+	if enemy_visible and enemy_visible_last
+		if abs(constrain(direction - enemy_direction, 360)) < 10
+			return 1
+		else
+			return 0
+		end
+	else
+		return 0
+	end
+end
+
+function can_shoot()
+	return fire_timeout == 0
+end
+
+# --------------------------- AUX ---------------------------
+
+function choose_search_side()
+	if enemy_visible
+		search_side = sign(enemy_angle)
+	else
+		search_side = randsign()
+	end
+end
+
+function choose_dodge_side()
+	dodge_side = randsign()
+end
+
+function reset_tracker()
+	tracker_self_x = 0
+	tracker_self_x_last = 0
+	tracker_self_y = 0
+	tracker_self_y_last = 0
+	tracker_enemy_x = 0
+	tracker_enemy_x_last = 0
+	tracker_enemy_y = 0
+	tracker_enemy_y_last = 0
+
+	if enemy_visible
+		extra_data_tracker()
+	end
+end
+
+function constrain(num, top)
+	if(num < 0)
+		num += top
+	end
+	if(num < 0)
+		num += top
+	end
+
+	if(num >= top)
+		num -= top
+	end
+	if(num >= top)
+		num -= top
+	end
+
+	return num
+end
+
+function to180range(num)
+	num = constrain(num, 360)
+	if num > 180
+		num -= 360
+	end
+	return num
+end
+
+function randsign()
+	if rand() < 0.5
+		return -1
+	else
+		return 1
+	end
+end
+
+function ptcX(distance, angle)		# Polar To Cartesian, X
+	return distance * cos(constrain(angle, 360))
+end
+
+function ptcY(distance, angle)		# Polar To Cartesian, Y
+	return distance * sin(constrain(angle, 360))
+end
+
+function getAngleBetweenVectors(vector1x, vector1y, vector2x, vector2y)
+	return atan2(vector2y, vector2x) - atan2(vector1y, vector1x)
+end
+
+function dot(vector1x, vector1y, vector2x, vector2y)
+	return (vector1x * vector2x) + (vector1y * vector2y)
+end
+
+function asin(x)
+	return atan2(x, sqrt((1.0 + x) * (1.0 - x)))
+end
+
+function acos(x)
+	return atan2(sqrt((1 + x) * (1 - x)), x)
+end
+
+function predictPositionX(originalx, originaly, velocityx, velocityy, frames)
+	return originalx + (velocityx * frames)
+end
+
+function predictPositionY(originalx, originaly, velocityx, velocityy, frames)
+	return originaly + (velocityy * frames)
+end
+
+function calcDistance(vector1x, vector1y, vector2x, vector2y)
+	x = vector2x - vector1x
+	y = vector2y - vector1y
+	return calcLength(x, y)
+end
+
+function calcLength(vectorx, vectory)
+	return sqrt((vectorx * vectorx) + (vectory * vectory))
+end
+
+function timeForBullet(distance)
+	return distance / 10
+end
+
+# ---------------------------------------------------------
+# Realtime tuning
+# uTURRET_MODE is recommended to be off. Turn on as an alternative strategy if things aren't quite working.
+#
+# uPASSTHROUGH_MODE is recommended to be 0. Try switching to 1 if the enemy has the upper-hand in passthroughs.
+#
+# uWEIGHTED_PREDICTIONS is recommended to be off. Turn it on only if the enemy does micro-dodging.
+# 
+# uSHARP_TURNS is recommended to be always on.
+# uSUPERSHARP_TURNS is recommended to be off. Turn it on only if the enemy ship manages to stay behind us
+# 					during sharp turns.
+# Other recommended values: uSHARP_TURN_ANGLE: 60; uSHARP_TURN_MIN_SPEED: 3
+# 
+# uDODGE_BULLETS is recommended to be always on.
+# uDODGE_FIRST_SIGHT is recommended to be on if the enemy ship shoots only when he is pointing at us.
+# uMICRO_DODGE is recommended to be off. It is an experimental setting that could be devastating if the enemy
+# 				does predictive shooting.
+# Other recommended values: uDODGE_ANGLE: 60
+#
+# uEXACT_FOLLOW = 0 is recommended to be off. Turn on to try as an alternative method if the enemy ship
+# 					uses borders too much, and you aren't satisfied with the state of things.
+# ---------------------------------------------------------
+
+# EOF
